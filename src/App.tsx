@@ -184,14 +184,12 @@ function Logo({ size = "md" }) {
   );
 }
 
-// ── Imagem com tamanho fixo e sem cortes ─────────────────────────────────────
 function RestaurantAvatar({ url, nome, size = 44, borderRadius = "50%" }) {
   const [error, setError] = useState(false);
   if (url && !error) {
     return (
       <div style={{ width: size, height: size, borderRadius, overflow: "hidden", flexShrink: 0, border: `2px solid ${C.border}`, background: C.surface2 }}>
-        <img src={url} alt={nome} onError={() => setError(true)}
-          style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }} />
+        <img src={url} alt={nome} onError={() => setError(true)} style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }} />
       </div>
     );
   }
@@ -276,7 +274,7 @@ function Sidebar({ tab, setTab, restaurant, onLogout, pendingCount = 0, waiterCo
   );
 }
 
-// ── Funções de arquivo ────────────────────────────────────────────────────────
+// ── Utilitários de data ───────────────────────────────────────────────────────
 function getInicioSemana(date = new Date()) {
   const d = new Date(date);
   const day = d.getDay();
@@ -296,102 +294,108 @@ function getSemanaLabel(inicio, fim) {
 function getDiaLabel(data) {
   return new Date(data + "T12:00:00").toLocaleDateString("pt-PT", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" });
 }
+function getFimDia() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
 
-// ── Arquivo automático diário (pedidos com mais de 24h) ───────────────────────
-async function arquivarPedidosDiarios(restaurantId) {
+// ── ARQUIVO AUTOMÁTICO COMPLETO ───────────────────────────────────────────────
+async function executarArquivoAutomatico(restaurantId) {
+  const hoje = new Date().toISOString().split("T")[0];
+  const limite24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const inicioDia = getFimDia();
+
   try {
-    const limite = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const pedidosAntigos = await sbFetch(`orders?restaurant_id=eq.${restaurantId}&created_at=lt.${limite}&select=*`);
-    if (!pedidosAntigos || pedidosAntigos.length === 0) return;
-
-    // Agrupar por dia
-    const porDia = {};
-    for (const p of pedidosAntigos) {
-      const dia = p.created_at.split("T")[0];
-      if (!porDia[dia]) porDia[dia] = [];
-      porDia[dia].push(p);
-    }
-
-    for (const [dia, pedidos] of Object.entries(porDia)) {
-      // Verificar se já foi arquivado
-      const existente = await sbFetch(`arquivo_pedidos_diario?restaurant_id=eq.${restaurantId}&data_arquivo=eq.${dia}&select=id&limit=1`);
-      if (existente && existente.length > 0) {
-        // Já existe — apagar os pedidos da tabela principal
-        for (const p of pedidos) {
-          await sbFetch(`orders_itens?order_id=eq.${p.id}`, { method: "DELETE" });
-          await sbFetch(`orders?id=eq.${p.id}`, { method: "DELETE" });
+    // ── 1. Arquivar PEDIDOS com mais de 24h ────────────────────────────────
+    const pedidosAntigos = await sbFetch(`orders?restaurant_id=eq.${restaurantId}&created_at=lt.${limite24h}&select=*`);
+    if (pedidosAntigos && pedidosAntigos.length > 0) {
+      const porDia = {};
+      for (const p of pedidosAntigos) {
+        const dia = p.created_at.split("T")[0];
+        if (!porDia[dia]) porDia[dia] = [];
+        porDia[dia].push(p);
+      }
+      for (const [dia, pedidos] of Object.entries(porDia)) {
+        const existente = await sbFetch(`arquivo_pedidos_diario?restaurant_id=eq.${restaurantId}&data_arquivo=eq.${dia}&select=id&limit=1`);
+        if (!existente || existente.length === 0) {
+          const pedidosComItens = await Promise.all(pedidos.map(async p => {
+            const itens = await sbFetch(`orders_itens?order_id=eq.${p.id}&select=*`);
+            return { ...p, itens: itens || [] };
+          }));
+          const totalVendas = pedidos.filter(p => p.status === "completed").reduce((s, p) => s + Number(p.total || 0), 0);
+          const inicioSemana = getInicioSemana(new Date(dia));
+          const fimSemana = getFimSemana(inicioSemana);
+          await sbFetch("arquivo_pedidos_diario", {
+            method: "POST",
+            body: JSON.stringify({ restaurant_id: restaurantId, data_arquivo: dia, semana_inicio: inicioSemana, semana_label: getSemanaLabel(inicioSemana, fimSemana), dia_label: getDiaLabel(dia), total_pedidos: pedidos.length, total_vendas: totalVendas, pedidos: pedidosComItens }),
+          });
         }
-        continue;
-      }
-
-      // Buscar itens
-      const pedidosComItens = await Promise.all(pedidos.map(async p => {
-        const itens = await sbFetch(`orders_itens?order_id=eq.${p.id}&select=*`);
-        return { ...p, itens: itens || [] };
-      }));
-
-      const totalVendas = pedidos.filter(p => p.status === "completed").reduce((s, p) => s + Number(p.total || 0), 0);
-      const inicioSemana = getInicioSemana(new Date(dia));
-      const fimSemana = getFimSemana(inicioSemana);
-      const semanaLabel = getSemanaLabel(inicioSemana, fimSemana);
-      const diaLabel = getDiaLabel(dia);
-
-      // Criar arquivo diário
-      await sbFetch("arquivo_pedidos_diario", {
-        method: "POST",
-        body: JSON.stringify({ restaurant_id: restaurantId, data_arquivo: dia, semana_inicio: inicioSemana, semana_label: semanaLabel, dia_label: diaLabel, total_pedidos: pedidos.length, total_vendas: totalVendas, pedidos: pedidosComItens }),
-      });
-
-      // Também arquivar nos relatórios diários
-      const existeRelatorio = await sbFetch(`relatorios_diarios?restaurant_id=eq.${restaurantId}&data_relatorio=eq.${dia}&select=id&limit=1`);
-      if (!existeRelatorio || existeRelatorio.length === 0) {
-        await sbFetch("relatorios_diarios", { method: "POST", body: JSON.stringify({ restaurant_id: restaurantId, data_relatorio: dia, total_pedidos: pedidos.length, total_vendas: totalVendas, pedidos: pedidosComItens }) });
-      }
-
-      // Apagar pedidos da tabela principal
-      for (const p of pedidos) {
-        await sbFetch(`orders_itens?order_id=eq.${p.id}`, { method: "DELETE" });
-        await sbFetch(`orders?id=eq.${p.id}`, { method: "DELETE" });
+        // Apagar pedidos da tabela principal
+        for (const p of pedidos) {
+          try { await sbFetch(`orders_itens?order_id=eq.${p.id}`, { method: "DELETE" }); } catch(e) {}
+          try { await sbFetch(`orders?id=eq.${p.id}`, { method: "DELETE" }); } catch(e) {}
+        }
       }
     }
-  } catch (e) { console.error("Erro arquivo diário:", e); }
-}
 
-// ── Apagar chamadas com mais de 24h ───────────────────────────────────────────
-async function limparChamadasAntigas(restaurantId) {
-  try {
-    const limite = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    await sbFetch(`chamadas_garcom?restaurant_id=eq.${restaurantId}&created_at=lt.${limite}`, { method: "DELETE" });
-  } catch (e) { console.error("Erro limpeza chamadas:", e); }
-}
-
-async function arquivarPedidosAnteriores(restaurantId) {
-  try {
-    const hoje = new Date().toISOString().split("T")[0];
-    const pedidosAntigos = await sbFetch(`orders?restaurant_id=eq.${restaurantId}&status=eq.completed&created_at=lt.${hoje}T00:00:00&select=*`);
-    if (!pedidosAntigos || pedidosAntigos.length === 0) return;
-    const porDia = {};
-    for (const p of pedidosAntigos) { const dia = p.created_at.split("T")[0]; if (!porDia[dia]) porDia[dia] = []; porDia[dia].push(p); }
-    for (const [dia, pedidos] of Object.entries(porDia)) {
-      const existente = await sbFetch(`relatorios_diarios?restaurant_id=eq.${restaurantId}&data_relatorio=eq.${dia}&select=id&limit=1`);
-      if (existente && existente.length > 0) continue;
-      const pedidosComItens = await Promise.all(pedidos.map(async (p) => { const itens = await sbFetch(`orders_itens?order_id=eq.${p.id}&select=*`); return { ...p, itens: itens || [] }; }));
-      const totalVendas = pedidos.reduce((s, p) => s + Number(p.total || 0), 0);
-      await sbFetch("relatorios_diarios", { method: "POST", body: JSON.stringify({ restaurant_id: restaurantId, data_relatorio: dia, total_pedidos: pedidos.length, total_vendas: totalVendas, pedidos: pedidosComItens }) });
+    // ── 2. Arquivar RELATÓRIOS do dia anterior e apagá-los ─────────────────
+    const relatoriosNaoArquivados = await sbFetch(`relatorios_diarios?restaurant_id=eq.${restaurantId}&data_relatorio=lt.${hoje}&arquivado=eq.false&select=*`);
+    if (relatoriosNaoArquivados && relatoriosNaoArquivados.length > 0) {
+      // Agrupar por semana
+      const porSemana = {};
+      for (const r of relatoriosNaoArquivados) {
+        const inicioSemana = getInicioSemana(new Date(r.data_relatorio));
+        if (!porSemana[inicioSemana]) porSemana[inicioSemana] = [];
+        porSemana[inicioSemana].push(r);
+      }
+      for (const [inicioSemana, relatorios] of Object.entries(porSemana)) {
+        const fimSemana = getFimSemana(inicioSemana);
+        const semanaLabel = getSemanaLabel(inicioSemana, fimSemana);
+        const totalVendas = relatorios.reduce((s, r) => s + Number(r.total_vendas || 0), 0);
+        const totalPedidos = relatorios.reduce((s, r) => s + Number(r.total_pedidos || 0), 0);
+        // Verificar se já existe arquivo semanal
+        const existeSemanal = await sbFetch(`arquivo_relatorios_semanal?restaurant_id=eq.${restaurantId}&semana_inicio=eq.${inicioSemana}&select=id&limit=1`);
+        if (existeSemanal && existeSemanal.length > 0) {
+          // Atualizar arquivo semanal existente com os novos relatórios
+          const arquivoExistente = await sbFetch(`arquivo_relatorios_semanal?restaurant_id=eq.${restaurantId}&semana_inicio=eq.${inicioSemana}&select=*&limit=1`);
+          if (arquivoExistente?.[0]) {
+            const relatoriosExistentes = arquivoExistente[0].relatorios || [];
+            const novosRelatorios = [...relatoriosExistentes, ...relatorios];
+            const novoTotal = novosRelatorios.reduce((s, r) => s + Number(r.total_vendas || 0), 0);
+            const novosPedidos = novosRelatorios.reduce((s, r) => s + Number(r.total_pedidos || 0), 0);
+            await sbFetch(`arquivo_relatorios_semanal?id=eq.${arquivoExistente[0].id}`, { method: "PATCH", body: JSON.stringify({ relatorios: novosRelatorios, total_vendas: novoTotal, total_pedidos: novosPedidos }) });
+          }
+        } else {
+          // Criar novo arquivo semanal
+          await sbFetch("arquivo_relatorios_semanal", {
+            method: "POST",
+            body: JSON.stringify({ restaurant_id: restaurantId, semana_inicio: inicioSemana, semana_fim: fimSemana, semana_label: semanaLabel, total_pedidos: totalPedidos, total_vendas: totalVendas, relatorios }),
+          });
+        }
+        // Marcar relatórios como arquivados e apagar da tabela principal
+        for (const r of relatorios) {
+          try { await sbFetch(`relatorios_diarios?id=eq.${r.id}`, { method: "DELETE" }); } catch(e) {}
+        }
+      }
     }
-  } catch (e) { console.error("Erro ao arquivar:", e); }
+
+    // ── 3. Apagar chamadas do dia anterior (às 00:00) ──────────────────────
+    await sbFetch(`chamadas_garcom?restaurant_id=eq.${restaurantId}&created_at=lt.${inicioDia}`, { method: "DELETE" });
+
+  } catch (e) { console.error("Erro arquivo automático:", e); }
 }
 
-function gerarPDF(relatorio, restaurantNome, titulo) {
-  const pedidos = relatorio.pedidos || [];
+function gerarPDF(dadosPDF, restaurantNome, titulo) {
+  const pedidos = dadosPDF.pedidos || [];
   const linhasPedidos = pedidos.map((p) => {
     const itens = (p.itens || []).map(item => `<tr><td style="padding:6px 12px;color:#6b7280;font-size:13px">${item.quantity}× ${item.item_name}</td><td style="padding:6px 12px;text-align:right;font-size:13px">${Number(item.subtotal).toFixed(0)} Kz</td></tr>`).join("");
-    return `<div style="margin-bottom:16px;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden"><div style="background:#f9fafb;padding:12px 16px;display:flex;justify-content:space-between"><div><strong>${p.customer_name || "Cliente"}</strong><span style="color:#6b7280;margin-left:12px;font-size:13px">Mesa ${p.table_number} · ${p.payment_method === "cash" ? "Cash" : "Cartão"}</span>${p.observacoes ? `<div style="color:#9ca3af;font-size:12px;margin-top:2px">Obs: ${p.observacoes}</div>` : ""}</div><strong style="color:#D4AF37">${Number(p.total || 0).toFixed(0)} Kz</strong></div><table style="width:100%;border-collapse:collapse">${itens}</table></div>`;
+    return `<div style="margin-bottom:16px;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden"><div style="background:#f9fafb;padding:12px 16px;display:flex;justify-content:space-between"><div><strong>${p.customer_name || "Cliente"}</strong><span style="color:#6b7280;margin-left:12px;font-size:13px">Mesa ${p.table_number} · ${p.payment_method === "cash" ? "Cash" : "Cartão"}</span>${p.observacoes ? `<div style="color:#3B82F6;font-size:12px;margin-top:2px">📝 ${p.observacoes}</div>` : ""}</div><strong style="color:#D4AF37">${Number(p.total || 0).toFixed(0)} Kz</strong></div><table style="width:100%;border-collapse:collapse">${itens}</table></div>`;
   }).join("");
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${titulo}</title><style>body{font-family:'Inter',Arial,sans-serif;background:#fff;color:#111827;margin:0;padding:32px}.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:32px;padding-bottom:20px;border-bottom:2px solid #D4AF37}.logo{font-size:24px;font-weight:900}.logo span{color:#D4AF37}.total-box{background:linear-gradient(135deg,#D4AF37,#FF8A00);border-radius:12px;padding:16px 24px;color:#0B0D12;display:flex;justify-content:space-between;align-items:center;margin-top:16px}.footer{margin-top:32px;padding-top:20px;border-top:1px solid #e5e7eb;display:flex;justify-content:space-between;color:#9ca3af;font-size:12px}</style></head><body>
   <div class="header"><div><div class="logo">Food<span>Flow</span></div><div style="color:#6b7280;font-size:14px">${restaurantNome}</div></div><div style="text-align:right"><div style="font-weight:700">${titulo}</div></div></div>
-  ${linhasPedidos}
-  <div class="total-box"><span style="font-weight:800;font-size:16px">TOTAL</span><span style="font-weight:900;font-size:22px">${Number(relatorio.total_vendas || 0).toFixed(0)} Kz</span></div>
+  ${pedidos.length > 0 ? linhasPedidos : '<p style="color:#9ca3af;text-align:center;padding:40px">Sem pedidos neste período</p>'}
+  <div class="total-box"><span style="font-weight:800;font-size:16px">TOTAL</span><span style="font-weight:900;font-size:22px">${Number(dadosPDF.total_vendas || 0).toFixed(0)} Kz</span></div>
   <div class="footer"><span>Gerado por FoodFlow · ${new Date().toLocaleString("pt-PT")}</span><span>${restaurantNome}</span></div>
   </body></html>`;
   const win = window.open("", "_blank");
@@ -399,7 +403,7 @@ function gerarPDF(relatorio, restaurantNome, titulo) {
   setTimeout(() => win.print(), 800);
 }
 
-// ── Dashboard ────────────────────────────────────────────────────────────────
+// ── Dashboard ─────────────────────────────────────────────────────────────────
 function DashboardTab({ restaurant, pendingCount, waiterCount }) {
   const [stats, setStats] = useState({ menus: 0, mesas: 0, orders: 0, revenue: 0, cats: 0 });
   const [recentOrders, setRecentOrders] = useState([]);
@@ -463,7 +467,127 @@ function DashboardTab({ restaurant, pendingCount, waiterCount }) {
   );
 }
 
-// ── Arquivo Pedidos Diário + Semanal ─────────────────────────────────────────
+// ── Relatórios (apenas do dia atual) ─────────────────────────────────────────
+function RelatoriosTab({ restaurant, showToast }) {
+  const [relatorios, setRelatorios] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [viewing, setViewing] = useState(null);
+
+  const load = useCallback(async () => {
+    if (!restaurant) return; setLoading(true);
+    try {
+      const hoje = new Date().toISOString().split("T")[0];
+      // Mostrar apenas relatórios de hoje (os anteriores já estão arquivados)
+      const r = await sbFetch(`relatorios_diarios?restaurant_id=eq.${restaurant.id}&select=*&order=data_relatorio.desc`);
+      setRelatorios(r || []);
+    } catch (e) { showToast(e.message, "error"); } finally { setLoading(false); }
+  }, [restaurant]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const gerarManual = async () => {
+    try {
+      // Gerar relatório de hoje
+      const hoje = new Date().toISOString().split("T")[0];
+      const pedidosHoje = await sbFetch(`orders?restaurant_id=eq.${restaurant.id}&created_at=gte.${hoje}T00:00:00&status=eq.completed&select=*`);
+      if (!pedidosHoje || pedidosHoje.length === 0) { showToast("Sem pedidos concluídos hoje", "error"); return; }
+      const existente = await sbFetch(`relatorios_diarios?restaurant_id=eq.${restaurant.id}&data_relatorio=eq.${hoje}&select=id&limit=1`);
+      if (existente && existente.length > 0) { showToast("Relatório de hoje já existe!"); load(); return; }
+      const pedidosComItens = await Promise.all(pedidosHoje.map(async p => { const itens = await sbFetch(`orders_itens?order_id=eq.${p.id}&select=*`); return { ...p, itens: itens || [] }; }));
+      const totalVendas = pedidosHoje.reduce((s, p) => s + Number(p.total || 0), 0);
+      await sbFetch("relatorios_diarios", { method: "POST", body: JSON.stringify({ restaurant_id: restaurant.id, data_relatorio: hoje, total_pedidos: pedidosHoje.length, total_vendas: totalVendas, pedidos: pedidosComItens, arquivado: false }) });
+      showToast("Relatório gerado!"); load();
+    } catch (e) { showToast(e.message, "error"); }
+  };
+
+  const formatDate = d => new Date(d + "T12:00:00").toLocaleDateString("pt-PT", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+
+  if (viewing) {
+    const r = viewing;
+    return (
+      <div style={{ animation: "fadeIn .3s ease" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 24 }}>
+          <Btn variant="ghost" size="sm" icon="chevron" onClick={() => setViewing(null)} style={{ transform: "rotate(90deg)" }}>Voltar</Btn>
+          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: C.textMain, textTransform: "capitalize" }}>{formatDate(r.data_relatorio)}</h2>
+          <div style={{ marginLeft: "auto" }}><Btn variant="primary" icon="download" onClick={() => gerarPDF(r, restaurant.nome, formatDate(r.data_relatorio))}>Baixar PDF</Btn></div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 }}>
+          <StatCard icon="clip" label="Total Pedidos" value={r.total_pedidos} color={C.gold} />
+          <StatCard icon="money" label="Receita Total" value={`${Number(r.total_vendas).toFixed(0)} Kz`} color={C.success} />
+          <StatCard icon="food" label="Ticket Médio" value={`${(r.pedidos || []).length > 0 ? (Number(r.total_vendas) / (r.pedidos || []).length).toFixed(0) : 0} Kz`} color={C.blue} />
+        </div>
+        <Card style={{ padding: 24 }}>
+          <h3 style={{ margin: "0 0 20px", fontSize: 16, fontWeight: 700, color: C.textMain }}>Detalhe dos Pedidos</h3>
+          {(r.pedidos || []).length === 0 ? <p style={{ color: C.textSub, textAlign: "center", padding: 20 }}>Sem pedidos</p> : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              {(r.pedidos || []).map((p, pi) => (
+                <div key={pi} style={{ background: C.surface2, borderRadius: 12, overflow: "hidden" }}>
+                  <div style={{ padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${C.border}` }}>
+                    <div>
+                      <p style={{ margin: 0, fontWeight: 700, color: C.textMain }}>{p.customer_name || "Cliente"}</p>
+                      <p style={{ margin: "2px 0 0", fontSize: 12, color: C.textSub }}>Mesa {p.table_number} · {new Date(p.created_at).toLocaleTimeString("pt-PT", { hour: "2-digit", minute: "2-digit" })}</p>
+                      {p.observacoes && <p style={{ margin: "2px 0 0", fontSize: 11, color: C.blue }}>📝 {p.observacoes}</p>}
+                    </div>
+                    <span style={{ fontWeight: 800, color: C.gold, fontSize: 16 }}>{Number(p.total || 0).toFixed(0)} Kz</span>
+                  </div>
+                  {(p.itens || []).map((item, ii) => (
+                    <div key={ii} style={{ padding: "8px 16px", display: "flex", justifyContent: "space-between", borderBottom: `1px solid ${C.border}20` }}>
+                      <span style={{ fontSize: 13, color: C.textSub }}>{item.quantity}× {item.item_name}</span>
+                      <span style={{ fontSize: 13, color: C.textMain, fontWeight: 600 }}>{Number(item.subtotal).toFixed(0)} Kz</span>
+                    </div>
+                  ))}
+                </div>
+              ))}
+              <div style={{ display: "flex", justifyContent: "space-between", padding: "16px 20px", background: `linear-gradient(135deg, ${C.gold}20, ${C.orange}10)`, borderRadius: 12, border: `1px solid ${C.gold}30` }}>
+                <span style={{ fontWeight: 800, color: C.textMain, fontSize: 16 }}>TOTAL DO DIA</span>
+                <span style={{ fontWeight: 900, color: C.gold, fontSize: 20 }}>{Number(r.total_vendas).toFixed(0)} Kz</span>
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ animation: "fadeIn .4s ease" }}>
+      <Topbar title="Relatórios" subtitle="Relatórios do dia atual — os anteriores estão em Arquivo" restaurant={restaurant} />
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 18 }}>
+        <Btn variant="outline" icon="report" onClick={gerarManual}>Gerar relatório de hoje</Btn>
+      </div>
+      {loading ? <Spinner /> : relatorios.length === 0 ? (
+        <Card style={{ padding: 60, textAlign: "center" }}>
+          <Icon name="report" size={40} color={C.textMuted} />
+          <p style={{ color: C.textSub, marginTop: 12, fontWeight: 600 }}>Nenhum relatório hoje</p>
+          <p style={{ color: C.textMuted, fontSize: 13, marginTop: 6 }}>Os relatórios dos dias anteriores estão em Arquivo Relatórios</p>
+        </Card>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {relatorios.map(r => (
+            <Card key={r.id}>
+              <div style={{ padding: "18px 20px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div>
+                  <p style={{ margin: "0 0 4px", fontWeight: 800, color: C.textMain, fontSize: 15, textTransform: "capitalize" }}>{formatDate(r.data_relatorio)}</p>
+                  <div style={{ display: "flex", gap: 16 }}>
+                    <span style={{ fontSize: 13, color: C.textSub }}><span style={{ color: C.gold, fontWeight: 700 }}>{r.total_pedidos}</span> pedidos</span>
+                    <span style={{ fontSize: 13, color: C.textSub }}>Total: <span style={{ color: C.success, fontWeight: 700 }}>{Number(r.total_vendas).toFixed(0)} Kz</span></span>
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <p style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.gold }}>{Number(r.total_vendas).toFixed(0)} Kz</p>
+                  <Btn variant="blue" size="sm" icon="eye" onClick={() => setViewing(r)}>Ver</Btn>
+                  <Btn variant="dark" size="sm" icon="download" onClick={() => gerarPDF(r, restaurant.nome, formatDate(r.data_relatorio))}>PDF</Btn>
+                </div>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Arquivo Pedidos (Semana → Dia → Pedidos) ─────────────────────────────────
 function ArquivoPedidosTab({ restaurant, showToast }) {
   const [arquivos, setArquivos] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -474,7 +598,6 @@ function ArquivoPedidosTab({ restaurant, showToast }) {
     if (!restaurant) return; setLoading(true);
     try {
       const a = await sbFetch(`arquivo_pedidos_diario?restaurant_id=eq.${restaurant.id}&select=*&order=data_arquivo.desc`);
-      // Agrupar por semana
       const porSemana = {};
       for (const d of (a || [])) {
         const key = d.semana_inicio;
@@ -494,7 +617,7 @@ function ArquivoPedidosTab({ restaurant, showToast }) {
 
   return (
     <div style={{ animation: "fadeIn .4s ease" }}>
-      <Topbar title="Arquivo de Pedidos" subtitle="Pedidos organizados por semana e dia" restaurant={restaurant} />
+      <Topbar title="Arquivo de Pedidos" subtitle="Pedidos organizados por semana → dia" restaurant={restaurant} />
       {loading ? <Spinner /> : arquivos.length === 0 ? (
         <Card style={{ padding: 60, textAlign: "center" }}>
           <Icon name="folder" size={40} color={C.textMuted} />
@@ -505,7 +628,6 @@ function ArquivoPedidosTab({ restaurant, showToast }) {
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           {arquivos.map(semana => (
             <Card key={semana.semana_inicio} style={{ overflow: "hidden" }}>
-              {/* Cabeçalho da semana */}
               <div style={{ padding: "18px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer", background: expandedSemana === semana.semana_inicio ? C.surface2 : "transparent" }} onClick={() => setExpandedSemana(expandedSemana === semana.semana_inicio ? null : semana.semana_inicio)}>
                 <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
                   <div style={{ width: 44, height: 44, borderRadius: 12, background: C.purple + "20", border: `1px solid ${C.purple}30`, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -522,23 +644,16 @@ function ArquivoPedidosTab({ restaurant, showToast }) {
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <p style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.gold }}>{semana.total_vendas.toFixed(0)} Kz</p>
-                  <div style={{ color: C.textSub, transition: "transform .2s", transform: expandedSemana === semana.semana_inicio ? "rotate(180deg)" : "rotate(0)" }}>
-                    <Icon name="chevron" size={18} color={C.textSub} />
-                  </div>
+                  <div style={{ color: C.textSub, transition: "transform .2s", transform: expandedSemana === semana.semana_inicio ? "rotate(180deg)" : "rotate(0)" }}><Icon name="chevron" size={18} color={C.textSub} /></div>
                 </div>
               </div>
-
-              {/* Dias da semana */}
               {expandedSemana === semana.semana_inicio && (
                 <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 16px", display: "flex", flexDirection: "column", gap: 8, animation: "fadeIn .2s ease" }}>
                   {semana.dias.map(dia => (
                     <div key={dia.data_arquivo} style={{ background: C.surface2, borderRadius: 12, overflow: "hidden" }}>
-                      {/* Cabeçalho do dia */}
                       <div style={{ padding: "14px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }} onClick={() => setExpandedDia(expandedDia === dia.data_arquivo ? null : dia.data_arquivo)}>
                         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                          <div style={{ width: 36, height: 36, borderRadius: 9, background: C.blue + "20", border: `1px solid ${C.blue}30`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                            <Icon name="calendar" size={16} color={C.blue} />
-                          </div>
+                          <div style={{ width: 36, height: 36, borderRadius: 9, background: C.blue + "20", border: `1px solid ${C.blue}30`, display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="calendar" size={16} color={C.blue} /></div>
                           <div>
                             <p style={{ margin: 0, fontWeight: 700, color: C.textMain, fontSize: 14, textTransform: "capitalize" }}>{dia.dia_label}</p>
                             <p style={{ margin: "2px 0 0", fontSize: 12, color: C.textSub }}>{dia.total_pedidos} pedidos · {Number(dia.total_vendas).toFixed(0)} Kz</p>
@@ -546,13 +661,9 @@ function ArquivoPedidosTab({ restaurant, showToast }) {
                         </div>
                         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                           <Btn variant="dark" size="sm" icon="download" onClick={e => { e.stopPropagation(); gerarPDF(dia, restaurant.nome, dia.dia_label); }}>PDF</Btn>
-                          <div style={{ color: C.textSub, transition: "transform .2s", transform: expandedDia === dia.data_arquivo ? "rotate(180deg)" : "rotate(0)" }}>
-                            <Icon name="chevron" size={15} color={C.textSub} />
-                          </div>
+                          <div style={{ color: C.textSub, transition: "transform .2s", transform: expandedDia === dia.data_arquivo ? "rotate(180deg)" : "rotate(0)" }}><Icon name="chevron" size={15} color={C.textSub} /></div>
                         </div>
                       </div>
-
-                      {/* Pedidos do dia */}
                       {expandedDia === dia.data_arquivo && (
                         <div style={{ borderTop: `1px solid ${C.border}30`, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 8, animation: "fadeIn .2s ease" }}>
                           {(dia.pedidos || []).map((p, i) => (
@@ -588,7 +699,6 @@ function ArquivoPedidosTab({ restaurant, showToast }) {
                       )}
                     </div>
                   ))}
-                  {/* Total da semana */}
                   <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 16px", background: C.purple + "15", borderRadius: 10, border: `1px solid ${C.purple}30`, marginTop: 4 }}>
                     <span style={{ fontWeight: 800, color: C.textMain }}>Total da semana</span>
                     <span style={{ fontWeight: 900, color: C.purple, fontSize: 16 }}>{semana.total_vendas.toFixed(0)} Kz</span>
@@ -603,121 +713,63 @@ function ArquivoPedidosTab({ restaurant, showToast }) {
   );
 }
 
+// ── Arquivo Relatórios Semanal ────────────────────────────────────────────────
 function ArquivoRelatoriosTab({ restaurant, showToast }) {
   const [arquivos, setArquivos] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [expanded, setExpanded] = useState(null);
+  const [expandedSemana, setExpandedSemana] = useState(null);
+  const [viewingRelatorio, setViewingRelatorio] = useState(null);
+
   const load = useCallback(async () => {
     if (!restaurant) return; setLoading(true);
     try { const a = await sbFetch(`arquivo_relatorios_semanal?restaurant_id=eq.${restaurant.id}&select=*&order=semana_inicio.desc`); setArquivos(a || []); }
     catch (e) { showToast(e.message, "error"); } finally { setLoading(false); }
   }, [restaurant]);
-  useEffect(() => { load(); }, [load]);
-  const formatDate = d => new Date(d + "T12:00:00").toLocaleDateString("pt-PT", { weekday: "short", day: "2-digit", month: "2-digit" });
-  return (
-    <div style={{ animation: "fadeIn .4s ease" }}>
-      <Topbar title="Arquivo de Relatórios" subtitle="Relatórios organizados por semana" restaurant={restaurant} />
-      {loading ? <Spinner /> : arquivos.length === 0 ? (
-        <Card style={{ padding: 60, textAlign: "center" }}><Icon name="folder" size={40} color={C.textMuted} /><p style={{ color: C.textSub, marginTop: 12, fontWeight: 600 }}>Nenhum arquivo ainda</p></Card>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {arquivos.map(a => (
-            <Card key={a.id} style={{ overflow: "hidden" }}>
-              <div style={{ padding: "18px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }} onClick={() => setExpanded(expanded === a.id ? null : a.id)}>
-                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                  <div style={{ width: 44, height: 44, borderRadius: 12, background: C.blue + "20", border: `1px solid ${C.blue}30`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                    <Icon name={expanded === a.id ? "folderOpen" : "folder"} size={20} color={C.blue} />
-                  </div>
-                  <div>
-                    <p style={{ margin: "0 0 4px", fontWeight: 800, color: C.textMain, fontSize: 15 }}>{a.semana_label}</p>
-                    <div style={{ display: "flex", gap: 14 }}>
-                      <span style={{ fontSize: 13, color: C.textSub }}><span style={{ color: C.gold, fontWeight: 700 }}>{a.total_pedidos}</span> pedidos</span>
-                      <span style={{ fontSize: 13, color: C.textSub }}>Total: <span style={{ color: C.success, fontWeight: 700 }}>{Number(a.total_vendas).toFixed(0)} Kz</span></span>
-                    </div>
-                  </div>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <p style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.gold }}>{Number(a.total_vendas).toFixed(0)} Kz</p>
-                  <Btn variant="dark" size="sm" icon="download" onClick={e => { e.stopPropagation(); gerarPDF({ ...a, pedidos: (a.relatorios || []).flatMap(r => r.pedidos || []) }, restaurant.nome, a.semana_label); }}>PDF</Btn>
-                  <div style={{ color: C.textSub, transition: "transform .2s", transform: expanded === a.id ? "rotate(180deg)" : "rotate(0)" }}><Icon name="chevron" size={18} color={C.textSub} /></div>
-                </div>
-              </div>
-              {expanded === a.id && (
-                <div style={{ borderTop: `1px solid ${C.border}`, padding: "16px 20px", animation: "fadeIn .2s ease" }}>
-                  {(a.relatorios || []).length === 0 ? <p style={{ color: C.textMuted, fontSize: 13 }}>Sem relatórios</p> : (
-                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                      {(a.relatorios || []).map((r, i) => (
-                        <div key={i} style={{ background: C.surface2, borderRadius: 10, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                            <Icon name="calendar" size={15} color={C.blue} />
-                            <div><p style={{ margin: 0, fontWeight: 700, color: C.textMain, fontSize: 14, textTransform: "capitalize" }}>{formatDate(r.data_relatorio)}</p><p style={{ margin: "2px 0 0", fontSize: 12, color: C.textSub }}>{r.total_pedidos} pedidos</p></div>
-                          </div>
-                          <span style={{ fontWeight: 800, color: C.gold, fontSize: 15 }}>{Number(r.total_vendas).toFixed(0)} Kz</span>
-                        </div>
-                      ))}
-                      <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 16px", background: C.blue + "15", borderRadius: 10, border: `1px solid ${C.blue}30`, marginTop: 4 }}>
-                        <span style={{ fontWeight: 800, color: C.textMain }}>Total da semana</span>
-                        <span style={{ fontWeight: 900, color: C.gold, fontSize: 16 }}>{Number(a.total_vendas).toFixed(0)} Kz</span>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </Card>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
 
-function RelatoriosTab({ restaurant, showToast }) {
-  const [relatorios, setRelatorios] = useState([]); const [loading, setLoading] = useState(true); const [viewing, setViewing] = useState(null);
-  const load = useCallback(async () => {
-    if (!restaurant) return; setLoading(true);
-    try { const r = await sbFetch(`relatorios_diarios?restaurant_id=eq.${restaurant.id}&select=*&order=data_relatorio.desc`); setRelatorios(r || []); }
-    catch (e) { showToast(e.message, "error"); } finally { setLoading(false); }
-  }, [restaurant]);
   useEffect(() => { load(); }, [load]);
-  const gerarManual = async () => {
-    try { await arquivarPedidosAnteriores(restaurant.id); showToast("Relatórios gerados!"); load(); } catch (e) { showToast(e.message, "error"); }
-  };
-  const formatDate = d => new Date(d + "T12:00:00").toLocaleDateString("pt-PT", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-  if (viewing) {
-    const r = viewing;
+
+  const formatDate = d => new Date(d + "T12:00:00").toLocaleDateString("pt-PT", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" });
+  const formatDateShort = d => new Date(d + "T12:00:00").toLocaleDateString("pt-PT", { weekday: "short", day: "2-digit", month: "2-digit" });
+
+  if (viewingRelatorio) {
+    const r = viewingRelatorio;
     return (
       <div style={{ animation: "fadeIn .3s ease" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 24 }}>
-          <Btn variant="ghost" size="sm" icon="chevron" onClick={() => setViewing(null)} style={{ transform: "rotate(90deg)" }}>Voltar</Btn>
+          <Btn variant="ghost" size="sm" icon="chevron" onClick={() => setViewingRelatorio(null)} style={{ transform: "rotate(90deg)" }}>Voltar</Btn>
           <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: C.textMain, textTransform: "capitalize" }}>{formatDate(r.data_relatorio)}</h2>
           <div style={{ marginLeft: "auto" }}><Btn variant="primary" icon="download" onClick={() => gerarPDF(r, restaurant.nome, formatDate(r.data_relatorio))}>Baixar PDF</Btn></div>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 }}>
           <StatCard icon="clip" label="Total Pedidos" value={r.total_pedidos} color={C.gold} />
-          <StatCard icon="money" label="Receita Total" value={`${Number(r.total_vendas).toFixed(0)} Kz`} color={C.success} />
+          <StatCard icon="money" label="Receita" value={`${Number(r.total_vendas).toFixed(0)} Kz`} color={C.success} />
           <StatCard icon="food" label="Ticket Médio" value={`${(r.pedidos || []).length > 0 ? (Number(r.total_vendas) / (r.pedidos || []).length).toFixed(0) : 0} Kz`} color={C.blue} />
         </div>
         <Card style={{ padding: 24 }}>
-          <h3 style={{ margin: "0 0 20px", fontSize: 16, fontWeight: 700, color: C.textMain }}>Detalhe dos Pedidos</h3>
+          <h3 style={{ margin: "0 0 20px", fontSize: 16, fontWeight: 700, color: C.textMain }}>Pedidos do dia</h3>
           {(r.pedidos || []).length === 0 ? <p style={{ color: C.textSub, textAlign: "center", padding: 20 }}>Sem pedidos</p> : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {(r.pedidos || []).map((p, pi) => (
                 <div key={pi} style={{ background: C.surface2, borderRadius: 12, overflow: "hidden" }}>
-                  <div style={{ padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${C.border}` }}>
-                    <div><p style={{ margin: 0, fontWeight: 700, color: C.textMain }}>{p.customer_name || "Cliente"}</p><p style={{ margin: "2px 0 0", fontSize: 12, color: C.textSub }}>Mesa {p.table_number} · {new Date(p.created_at).toLocaleTimeString("pt-PT", { hour: "2-digit", minute: "2-digit" })}</p>{p.observacoes && <p style={{ margin: "2px 0 0", fontSize: 11, color: C.blue }}>📝 {p.observacoes}</p>}</div>
-                    <span style={{ fontWeight: 800, color: C.gold, fontSize: 16 }}>{Number(p.total || 0).toFixed(0)} Kz</span>
+                  <div style={{ padding: "12px 16px", display: "flex", justifyContent: "space-between", borderBottom: `1px solid ${C.border}` }}>
+                    <div>
+                      <p style={{ margin: 0, fontWeight: 700, color: C.textMain }}>{p.customer_name || "Cliente"}</p>
+                      <p style={{ margin: "2px 0 0", fontSize: 12, color: C.textSub }}>Mesa {p.table_number} · {new Date(p.created_at).toLocaleTimeString("pt-PT", { hour: "2-digit", minute: "2-digit" })}</p>
+                      {p.observacoes && <p style={{ margin: "2px 0 0", fontSize: 11, color: C.blue }}>📝 {p.observacoes}</p>}
+                    </div>
+                    <span style={{ fontWeight: 800, color: C.gold }}>{Number(p.total || 0).toFixed(0)} Kz</span>
                   </div>
                   {(p.itens || []).map((item, ii) => (
-                    <div key={ii} style={{ padding: "8px 16px", display: "flex", justifyContent: "space-between", borderBottom: `1px solid ${C.border}20` }}>
-                      <span style={{ fontSize: 13, color: C.textSub }}>{item.quantity}× {item.item_name}</span>
-                      <span style={{ fontSize: 13, color: C.textMain, fontWeight: 600 }}>{Number(item.subtotal).toFixed(0)} Kz</span>
+                    <div key={ii} style={{ padding: "6px 16px", display: "flex", justifyContent: "space-between", borderBottom: `1px solid ${C.border}20` }}>
+                      <span style={{ fontSize: 12, color: C.textSub }}>{item.quantity}× {item.item_name}</span>
+                      <span style={{ fontSize: 12, color: C.textMain, fontWeight: 600 }}>{Number(item.subtotal).toFixed(0)} Kz</span>
                     </div>
                   ))}
                 </div>
               ))}
-              <div style={{ display: "flex", justifyContent: "space-between", padding: "16px 20px", background: `linear-gradient(135deg, ${C.gold}20, ${C.orange}10)`, borderRadius: 12, border: `1px solid ${C.gold}30` }}>
-                <span style={{ fontWeight: 800, color: C.textMain, fontSize: 16 }}>TOTAL DO DIA</span>
-                <span style={{ fontWeight: 900, color: C.gold, fontSize: 20 }}>{Number(r.total_vendas).toFixed(0)} Kz</span>
+              <div style={{ display: "flex", justifyContent: "space-between", padding: "14px 18px", background: `linear-gradient(135deg, ${C.gold}20, ${C.orange}10)`, borderRadius: 12, border: `1px solid ${C.gold}30` }}>
+                <span style={{ fontWeight: 800, color: C.textMain }}>TOTAL</span>
+                <span style={{ fontWeight: 900, color: C.gold, fontSize: 18 }}>{Number(r.total_vendas).toFixed(0)} Kz</span>
               </div>
             </div>
           )}
@@ -725,24 +777,68 @@ function RelatoriosTab({ restaurant, showToast }) {
       </div>
     );
   }
+
   return (
     <div style={{ animation: "fadeIn .4s ease" }}>
-      <Topbar title="Relatórios Diários" subtitle="Arquivo de vendas por dia" restaurant={restaurant} />
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 18 }}><Btn variant="outline" icon="report" onClick={gerarManual}>Gerar relatórios agora</Btn></div>
-      {loading ? <Spinner /> : relatorios.length === 0 ? <Card style={{ padding: 60, textAlign: "center" }}><Icon name="report" size={40} color={C.textMuted} /><p style={{ color: C.textSub, marginTop: 12, fontWeight: 600 }}>Nenhum relatório ainda</p></Card> : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {relatorios.map(r => (
-            <Card key={r.id}>
-              <div style={{ padding: "18px 20px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div><p style={{ margin: "0 0 4px", fontWeight: 800, color: C.textMain, fontSize: 15, textTransform: "capitalize" }}>{formatDate(r.data_relatorio)}</p>
-                  <div style={{ display: "flex", gap: 16 }}><span style={{ fontSize: 13, color: C.textSub }}><span style={{ color: C.gold, fontWeight: 700 }}>{r.total_pedidos}</span> pedidos</span><span style={{ fontSize: 13, color: C.textSub }}>Total: <span style={{ color: C.success, fontWeight: 700 }}>{Number(r.total_vendas).toFixed(0)} Kz</span></span></div>
+      <Topbar title="Arquivo de Relatórios" subtitle="Relatórios arquivados por semana" restaurant={restaurant} />
+      {loading ? <Spinner /> : arquivos.length === 0 ? (
+        <Card style={{ padding: 60, textAlign: "center" }}>
+          <Icon name="folder" size={40} color={C.textMuted} />
+          <p style={{ color: C.textSub, marginTop: 12, fontWeight: 600 }}>Nenhum arquivo ainda</p>
+          <p style={{ color: C.textMuted, fontSize: 13, marginTop: 6 }}>Os relatórios são arquivados automaticamente no fim do dia</p>
+        </Card>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {arquivos.map(a => (
+            <Card key={a.id} style={{ overflow: "hidden" }}>
+              <div style={{ padding: "18px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer", background: expandedSemana === a.id ? C.surface2 : "transparent" }} onClick={() => setExpandedSemana(expandedSemana === a.id ? null : a.id)}>
+                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <div style={{ width: 44, height: 44, borderRadius: 12, background: C.blue + "20", border: `1px solid ${C.blue}30`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <Icon name={expandedSemana === a.id ? "folderOpen" : "folder"} size={20} color={C.blue} />
+                  </div>
+                  <div>
+                    <p style={{ margin: "0 0 4px", fontWeight: 800, color: C.textMain, fontSize: 15 }}>{a.semana_label}</p>
+                    <div style={{ display: "flex", gap: 14 }}>
+                      <span style={{ fontSize: 13, color: C.textSub }}><span style={{ color: C.gold, fontWeight: 700 }}>{a.total_pedidos}</span> pedidos</span>
+                      <span style={{ fontSize: 13, color: C.textSub }}>Total: <span style={{ color: C.success, fontWeight: 700 }}>{Number(a.total_vendas).toFixed(0)} Kz</span></span>
+                      <span style={{ fontSize: 13, color: C.textSub }}><span style={{ color: C.blue, fontWeight: 700 }}>{(a.relatorios || []).length}</span> dia(s)</span>
+                    </div>
+                  </div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <p style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.gold }}>{Number(r.total_vendas).toFixed(0)} Kz</p>
-                  <Btn variant="blue" size="sm" icon="eye" onClick={() => setViewing(r)}>Ver</Btn>
-                  <Btn variant="dark" size="sm" icon="download" onClick={() => gerarPDF(r, restaurant.nome, formatDate(r.data_relatorio))}>PDF</Btn>
+                  <p style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.gold }}>{Number(a.total_vendas).toFixed(0)} Kz</p>
+                  <Btn variant="dark" size="sm" icon="download" onClick={e => { e.stopPropagation(); gerarPDF({ ...a, pedidos: (a.relatorios || []).flatMap(r => r.pedidos || []) }, restaurant.nome, a.semana_label); }}>PDF Semana</Btn>
+                  <div style={{ color: C.textSub, transition: "transform .2s", transform: expandedSemana === a.id ? "rotate(180deg)" : "rotate(0)" }}><Icon name="chevron" size={18} color={C.textSub} /></div>
                 </div>
               </div>
+              {expandedSemana === a.id && (
+                <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 16px", display: "flex", flexDirection: "column", gap: 8, animation: "fadeIn .2s ease" }}>
+                  {(a.relatorios || []).length === 0 ? <p style={{ color: C.textMuted, fontSize: 13, padding: "8px 0" }}>Sem relatórios nesta semana</p> : (
+                    <>
+                      {(a.relatorios || []).map((r, i) => (
+                        <div key={i} style={{ background: C.surface2, borderRadius: 12, padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                            <div style={{ width: 36, height: 36, borderRadius: 9, background: C.gold + "20", border: `1px solid ${C.gold}30`, display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="calendar" size={16} color={C.gold} /></div>
+                            <div>
+                              <p style={{ margin: 0, fontWeight: 700, color: C.textMain, fontSize: 14, textTransform: "capitalize" }}>{formatDateShort(r.data_relatorio)}</p>
+                              <p style={{ margin: "2px 0 0", fontSize: 12, color: C.textSub }}>{r.total_pedidos} pedidos · {Number(r.total_vendas).toFixed(0)} Kz</p>
+                            </div>
+                          </div>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <span style={{ fontWeight: 800, color: C.gold, fontSize: 15 }}>{Number(r.total_vendas).toFixed(0)} Kz</span>
+                            <Btn variant="blue" size="sm" icon="eye" onClick={() => setViewingRelatorio(r)}>Ver</Btn>
+                            <Btn variant="dark" size="sm" icon="download" onClick={() => gerarPDF(r, restaurant.nome, formatDate(r.data_relatorio))}>PDF</Btn>
+                          </div>
+                        </div>
+                      ))}
+                      <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 16px", background: C.blue + "15", borderRadius: 10, border: `1px solid ${C.blue}30`, marginTop: 4 }}>
+                        <span style={{ fontWeight: 800, color: C.textMain }}>Total da semana</span>
+                        <span style={{ fontWeight: 900, color: C.gold, fontSize: 16 }}>{Number(a.total_vendas).toFixed(0)} Kz</span>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
             </Card>
           ))}
         </div>
@@ -770,10 +866,7 @@ function MenuTab({ restaurant, showToast }) {
       showToast(editing ? "Atualizado!" : "Criado!"); setShowForm(false); setEditing(null); setForm({ name: "", description: "", price: "", category: "", image_url: "", available: true }); load();
     } catch (e) { showToast(e.message, "error"); }
   };
-  const del = async (id) => {
-    if (!confirm("Eliminar?")) return;
-    try { await sbFetch(`menu_itens?id=eq.${id}`, { method: "DELETE" }); showToast("Eliminado!"); load(); } catch (e) { showToast(e.message, "error"); }
-  };
+  const del = async (id) => { if (!confirm("Eliminar?")) return; try { await sbFetch(`menu_itens?id=eq.${id}`, { method: "DELETE" }); showToast("Eliminado!"); load(); } catch (e) { showToast(e.message, "error"); } };
   const f = k => v => setForm(p => ({ ...p, [k]: v }));
   return (
     <div style={{ animation: "fadeIn .4s ease" }}>
@@ -781,7 +874,7 @@ function MenuTab({ restaurant, showToast }) {
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 18 }}><Btn variant="primary" icon="plus" onClick={() => { setEditing(null); setForm({ name: "", description: "", price: "", category: "", image_url: "", available: true }); setShowForm(true); }}>Novo Item</Btn></div>
       {showForm && (
         <Card style={{ padding: 26, marginBottom: 22 }}>
-          <h3 style={{ margin: "0 0 18px", fontSize: 16, fontWeight: 700, color: C.textMain }}>{editing ? "Editar Item" : "Novo Item"}</h3>
+          <h3 style={{ margin: "0 0 18px", fontSize: 16, fontWeight: 700, color: C.textMain }}>{editing ? "Editar" : "Novo Item"}</h3>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
             <Input label="Nome" value={form.name} onChange={f("name")} placeholder="Ex: Frango Grelhado" />
             <Input label="Preço (Kz)" value={form.price} onChange={f("price")} placeholder="0" type="number" />
@@ -794,7 +887,7 @@ function MenuTab({ restaurant, showToast }) {
             {form.image_url && (
               <div style={{ gridColumn: "1/-1" }}>
                 <label style={{ fontSize: 11, fontWeight: 600, color: C.textSub, textTransform: "uppercase", letterSpacing: 1, display: "block", marginBottom: 8 }}>Pré-visualização</label>
-                <div style={{ width: "100%", maxWidth: 320, height: 180, borderRadius: 12, overflow: "hidden", border: `1px solid ${C.border}`, background: C.surface2 }}>
+                <div style={{ width: "100%", maxWidth: 300, height: 160, borderRadius: 12, overflow: "hidden", border: `1px solid ${C.border}`, background: C.surface2 }}>
                   <img src={form.image_url} alt="preview" style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }} onError={e => e.target.style.display = "none"} />
                 </div>
               </div>
@@ -808,14 +901,9 @@ function MenuTab({ restaurant, showToast }) {
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(270px, 1fr))", gap: 14 }}>
           {items.map(item => (
             <Card key={item.id} style={{ overflow: "hidden" }}>
-              {/* ✅ Imagem com tamanho fixo e sem cortes */}
               <div style={{ width: "100%", height: 160, overflow: "hidden", background: C.surface2, position: "relative", flexShrink: 0 }}>
-                {item.image_url ? (
-                  <img src={item.image_url} alt={item.name} style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }} onError={e => { e.target.style.display = "none"; e.target.nextSibling.style.display = "flex"; }} />
-                ) : null}
-                <div style={{ width: "100%", height: "100%", display: item.image_url ? "none" : "flex", alignItems: "center", justifyContent: "center", position: "absolute", top: 0, left: 0 }}>
-                  <Icon name="food" size={36} color={C.textMuted} />
-                </div>
+                {item.image_url && <img src={item.image_url} alt={item.name} style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }} onError={e => e.target.style.display = "none"} />}
+                {!item.image_url && <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="food" size={36} color={C.textMuted} /></div>}
                 <div style={{ position: "absolute", top: 10, right: 10 }}><Badge color={item.available ? C.success : C.danger}>{item.available ? "Disponível" : "Indisponível"}</Badge></div>
               </div>
               <div style={{ padding: 16 }}>
@@ -850,17 +938,14 @@ function CategoriesTab({ restaurant, showToast }) {
     if (!name) return showToast("Nome obrigatório", "error"); setSaving(true);
     try { await sbFetch("categories", { method: "POST", body: JSON.stringify({ name, description: desc, restaurant_id: restaurant.id }) }); showToast("Criada!"); setName(""); setDesc(""); load(); } catch (e) { showToast(e.message, "error"); } finally { setSaving(false); }
   };
-  const del = async (id) => {
-    if (!confirm("Eliminar?")) return;
-    try { await sbFetch(`categories?id=eq.${id}`, { method: "DELETE" }); showToast("Eliminada!"); load(); } catch (e) { showToast(e.message, "error"); }
-  };
+  const del = async (id) => { if (!confirm("Eliminar?")) return; try { await sbFetch(`categories?id=eq.${id}`, { method: "DELETE" }); showToast("Eliminada!"); load(); } catch (e) { showToast(e.message, "error"); } };
   return (
     <div style={{ animation: "fadeIn .4s ease" }}>
       <Topbar title="Categorias" subtitle={`${cats.length} categoria(s)`} restaurant={restaurant} />
       <Card style={{ padding: 24, marginBottom: 18 }}>
         <h3 style={{ margin: "0 0 16px", fontSize: 15, fontWeight: 700, color: C.textMain }}>Nova Categoria</h3>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}><Input label="Nome" value={name} onChange={setName} placeholder="Ex: Entradas" /><Input label="Descrição" value={desc} onChange={setDesc} placeholder="Opcional" /></div>
-        <Btn variant="primary" icon="plus" onClick={save} disabled={saving} style={{ marginTop: 14 }}>{saving ? "A guardar..." : "Criar Categoria"}</Btn>
+        <Btn variant="primary" icon="plus" onClick={save} disabled={saving} style={{ marginTop: 14 }}>{saving ? "A guardar..." : "Criar"}</Btn>
       </Card>
       {loading ? <Spinner /> : cats.length === 0 ? <Card style={{ padding: 60, textAlign: "center" }}><Icon name="category" size={34} color={C.textMuted} /><p style={{ color: C.textSub, marginTop: 12 }}>Nenhuma categoria</p></Card> : (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -950,7 +1035,13 @@ function OrdersTab({ restaurant, showToast, onPendingCount }) {
           </button>
         ))}
       </div>
-      {loading ? <Spinner /> : filtered.length === 0 ? <Card style={{ padding: 60, textAlign: "center" }}><Icon name="orders" size={34} color={C.textMuted} /><p style={{ color: C.textSub, marginTop: 12 }}>Nenhum pedido nas últimas 24h</p><p style={{ color: C.textMuted, fontSize: 12, marginTop: 6 }}>Pedidos mais antigos estão em Arquivo de Pedidos</p></Card> : (
+      {loading ? <Spinner /> : filtered.length === 0 ? (
+        <Card style={{ padding: 60, textAlign: "center" }}>
+          <Icon name="orders" size={34} color={C.textMuted} />
+          <p style={{ color: C.textSub, marginTop: 12 }}>Nenhum pedido nas últimas 24h</p>
+          <p style={{ color: C.textMuted, fontSize: 12, marginTop: 6 }}>Pedidos mais antigos estão em Arquivo de Pedidos</p>
+        </Card>
+      ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {filtered.map(o => (
             <Card key={o.id} style={{ padding: 18, border: o.status === "pending" ? `1px solid ${C.orange}50` : `1px solid ${C.border}` }}>
@@ -1004,7 +1095,7 @@ function WaitersTab({ restaurant, showToast, onCountChange }) {
   const [calls, setCalls] = useState([]); const [loading, setLoading] = useState(true);
   const load = useCallback(async () => {
     if (!restaurant) return; setLoading(true);
-    try { const c = await sbFetch(`chamadas_garcom?restaurant_id=eq.${restaurant.id}&select=*&order=created_at.desc&limit=30`); setCalls(c || []); onCountChange?.((c || []).filter(x => x.status === "pendente").length); }
+    try { const c = await sbFetch(`chamadas_garcom?restaurant_id=eq.${restaurant.id}&select=*&order=created_at.desc&limit=50`); setCalls(c || []); onCountChange?.((c || []).filter(x => x.status === "pendente").length); }
     catch (e) { showToast(e.message, "error"); } finally { setLoading(false); }
   }, [restaurant]);
   useEffect(() => { load(); const i = setInterval(load, 6000); return () => clearInterval(i); }, [load]);
@@ -1013,7 +1104,7 @@ function WaitersTab({ restaurant, showToast, onCountChange }) {
   const atendidas = calls.filter(c => c.status === "atendido");
   return (
     <div style={{ animation: "fadeIn .4s ease" }}>
-      <Topbar title="Chamadas de Atendente" subtitle={`${pendentes.length} pendente(s) · apagadas após 24h`} restaurant={restaurant} />
+      <Topbar title="Chamadas de Atendente" subtitle={`${pendentes.length} pendente(s) · histórico apagado à meia-noite`} restaurant={restaurant} />
       {loading ? <Spinner /> : <>
         {pendentes.length > 0 && (
           <div style={{ marginBottom: 24 }}>
@@ -1034,8 +1125,8 @@ function WaitersTab({ restaurant, showToast, onCountChange }) {
           </div>
         )}
         <div>
-          <h3 style={{ margin: "0 0 14px", fontSize: 13, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: 1 }}>Histórico (últimas 24h)</h3>
-          {atendidas.length === 0 ? <Card style={{ padding: 40, textAlign: "center" }}><p style={{ color: C.textSub }}>Nenhuma chamada atendida ainda</p></Card> : (
+          <h3 style={{ margin: "0 0 14px", fontSize: 13, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: 1 }}>Histórico de hoje</h3>
+          {atendidas.length === 0 ? <Card style={{ padding: 40, textAlign: "center" }}><p style={{ color: C.textSub }}>Nenhuma chamada atendida hoje</p></Card> : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {atendidas.map(c => (
                 <Card key={c.id} style={{ padding: 14 }}>
@@ -1070,18 +1161,10 @@ function RestaurantTab({ restaurant, user, showToast, onSaved }) {
       <Topbar title="Restaurante" subtitle="Configurações e informações" restaurant={restaurant} />
       <Card style={{ padding: 28 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 24, paddingBottom: 22, borderBottom: `1px solid ${C.border}` }}>
-          {/* ✅ Avatar com tamanho fixo */}
           <div style={{ width: 72, height: 72, borderRadius: 16, overflow: "hidden", border: `2px solid ${C.border}`, flexShrink: 0, background: C.surface2 }}>
-            {form.avata_url ? (
-              <img src={form.avata_url} alt="logo" style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }} onError={e => { e.target.style.display = "none"; }} />
-            ) : (
-              <div style={{ width: "100%", height: "100%", background: `linear-gradient(135deg, ${C.gold}, ${C.orange})`, display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="fork" size={30} color="#0B0D12" /></div>
-            )}
+            {form.avata_url ? <img src={form.avata_url} alt="logo" style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }} onError={e => e.target.style.display = "none"} /> : <div style={{ width: "100%", height: "100%", background: `linear-gradient(135deg, ${C.gold}, ${C.orange})`, display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="fork" size={30} color="#0B0D12" /></div>}
           </div>
-          <div>
-            <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: C.textMain }}>{form.nome || "Nome do Restaurante"}</h2>
-            <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>{form.city}</p>
-          </div>
+          <div><h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: C.textMain }}>{form.nome || "Nome do Restaurante"}</h2><p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>{form.city}</p></div>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
           <Input label="Nome" value={form.nome} onChange={f("nome")} placeholder="Nome do restaurante" />
@@ -1223,9 +1306,8 @@ export default function App() {
       const r = await sbFetch(`Restaurants?user_id=eq.${u.id}&select=*&limit=1`);
       setRestaurant(r?.[0] || null);
       if (r?.[0]) {
-        await arquivarPedidosAnteriores(r[0].id);
-        await arquivarPedidosDiarios(r[0].id);
-        await limparChamadasAntigas(r[0].id);
+        // Executar todo o arquivo automático
+        await executarArquivoAutomatico(r[0].id);
         await checkMesaScans(r[0]);
         await checkWaiterCalls(r[0]);
       }
